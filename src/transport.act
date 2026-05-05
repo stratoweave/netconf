@@ -7,38 +7,14 @@ between them. It is useful to be able to abstract over the transport protocol
 and just use a pipe interface so that we can support multiple transport
 protocols without changing the protocol implementation.
 
-This module defines the Pipe protocol and a reference implementation using SSH
-as the transport as well as one over internal actor-to-actor communication. The
-SSH implementation is used by the NETCONF client, but can be used for other
-protocols as well.
-
-Pipe is meant to be a protocol but it's actually currently a class and we
-subclass it wrap up the actual transport protocols. This is a workaround for
-multiple issues. First, we want to use the Pipe protocol as the type for the
-netconf.Client and netconf.Server constructor but it leaks into becoming a type
-variable for Client / Server which means that everywhere these are used, they
-are now parameterized like Client[P(Pipe)]. Since the Pipe type is not visible
-in the interface of Client, this should ideally not be necessary, but right now
-the compiler doesn't differentiate between uses of a generic type variable in
-the constructor or interface. The other shortcoming is that actors cannot
-implement protocol extensions, so it becomes necessary to wrap them up in
-classes. The combination of these two shortcomings means that it is just much
-easier to just make Pipe a class and subclass it for the different transport
-protocols. In the future we'll try to fix this and then we can probably put the
-generic Pipe protocol in builtin.
+This module provides SSH and TCP Pipe adapters.
 """
 
 import logging
 import net
+from pipe import Pipe
 
 import ssh_client
-
-
-class Pipe(object):
-    write: proc(bytes) -> None
-    read_cb: proc(action(?Exception, ?bytes) -> None) -> None
-    close: proc(?action() -> None) -> None
-    restart: proc() -> None
 
 
 class SshPipe(Pipe):
@@ -105,127 +81,6 @@ class SshPipe(Pipe):
             c.restart()
         else:
             raise ValueError("Unable to restart, SSH pipe client not running")
-
-
-actor _ActorPipeEndpoint():
-    def _noop_read_cb(error: ?Exception, data: ?bytes):
-        pass
-
-    var _read_cb: action(?Exception, ?bytes) -> None = _noop_read_cb
-    var _has_read_cb = False
-    var _peer: ?_ActorPipeEndpoint = None
-    var _pending_in: list[bytes] = []
-    var _pending_out: list[bytes] = []
-    var _closed = False
-
-    def connect(peer: _ActorPipeEndpoint):
-        _peer = peer
-        if _closed:
-            return
-
-        while len(_pending_out) > 0:
-            data = _pending_out[0]
-            _pending_out = _pending_out[1:]
-            peer.deliver_from_peer(data)
-
-    def _emit_connected():
-        if not _has_read_cb or _closed:
-            return
-        await async _read_cb(None, None)
-
-    def _flush_pending_in():
-        if not _has_read_cb or _closed:
-            return
-
-        while len(_pending_in) > 0:
-            data = _pending_in[0]
-            _pending_in = _pending_in[1:]
-            await async _read_cb(None, data)
-
-    def deliver_from_peer(data: bytes):
-        if _closed:
-            return
-
-        if _has_read_cb:
-            await async _read_cb(None, data)
-        else:
-            _pending_in.append(data)
-
-    def write(data: bytes):
-        if _closed:
-            raise ValueError("Unable to write, actor pipe is closed")
-
-        peer = _peer
-        if peer is not None:
-            peer.deliver_from_peer(data)
-        else:
-            _pending_out.append(data)
-
-    def read_cb(cb: action(?Exception, ?bytes) -> None):
-        _read_cb = cb
-        _has_read_cb = True
-        _emit_connected()
-        _flush_pending_in()
-
-    def close(on_close: ?action() -> None):
-        if _closed:
-            if on_close is not None:
-                await async on_close()
-            return
-
-        _closed = True
-        if on_close is not None:
-            await async on_close()
-
-    def peer_restart():
-        _closed = False
-        _pending_in = []
-        _emit_connected()
-        _flush_pending_in()
-
-    def restart():
-        _closed = False
-        _pending_in = []
-        _pending_out = []
-
-        peer = _peer
-        if peer is not None:
-            peer.peer_restart()
-
-        _emit_connected()
-        _flush_pending_in()
-
-
-class ActorPipe(Pipe):
-    _endpoint: _ActorPipeEndpoint
-
-    def __init__(self, endpoint: _ActorPipeEndpoint):
-        self._endpoint = endpoint
-
-    proc def connect(self, peer: ActorPipe):
-        self._endpoint.connect(peer._endpoint)
-
-    proc def write(self, data: bytes):
-        self._endpoint.write(data)
-
-    proc def read_cb(self, cb: action(?Exception, ?bytes) -> None):
-        self._endpoint.read_cb(cb)
-
-    proc def close(self, on_close: ?action() -> None):
-        self._endpoint.close(on_close)
-
-    proc def restart(self):
-        self._endpoint.restart()
-
-
-def actor_pipe_pair() -> (client: ActorPipe, server: ActorPipe):
-    client_ep = _ActorPipeEndpoint()
-    server_ep = _ActorPipeEndpoint()
-    client_pipe = ActorPipe(client_ep)
-    server_pipe = ActorPipe(server_ep)
-    client_pipe.connect(server_pipe)
-    server_pipe.connect(client_pipe)
-    return (client=client_pipe, server=server_pipe)
 
 
 class TcpPipe(Pipe):

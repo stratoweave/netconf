@@ -19,11 +19,12 @@ import process
 import random
 import testing
 import xml
+from pipe import Pipe, actor_pipe_pair
 
 from buffer import Buffer, IncompleteReadError
 from fixups import FIXUPS
 from fixups.base import Fixup
-from transport import Pipe, SshPipe, TcpListenPipe, TcpPipe, TcpPipeListener, actor_pipe_pair
+from transport import SshPipe, TcpListenPipe, TcpPipe, TcpPipeListener
 
 SEPARATOR_FRAMING: int = 0
 CHUNKED_FRAMING: int = 1
