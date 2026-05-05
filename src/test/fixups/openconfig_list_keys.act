@@ -2,9 +2,9 @@ import process
 import testing
 import xml
 import netconf
+from pipe import actor_pipe_pair
 
 from fixups.openconfig_list_keys import XmlNav
-from transport import actor_pipe_pair
 
 
 def unwrap[T](a: ?T, msg: ?str=None) -> T:
