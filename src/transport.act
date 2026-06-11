@@ -7,58 +7,13 @@ between them. It is useful to be able to abstract over the transport protocol
 and just use a pipe interface so that we can support multiple transport
 protocols without changing the protocol implementation.
 
-This module provides SSH and TCP Pipe adapters.
+This module provides TCP Pipe adapters. SSH Pipe adapters (SshPipe,
+SshPipeListener) are provided by the ssh package's ssh.pipe module.
 """
 
 import logging
 import net
 from pipe import Pipe
-
-import ssh_client
-
-
-class SshPipe(Pipe):
-    _client: ssh_client.Client
-    @property
-    _read_cb: action(?Exception, ?bytes) -> None
-
-    def __init__(self,
-                 pcap,
-                 address: str,
-                 port: int,
-                 username: str,
-                 password: ?str,
-                 key: ?str,
-                 subsystem: ?str=None,
-                 skip_host_key_check: bool=False,
-                 log_handler: ?logging.Handler=None,
-                 read_cb: action(?Exception, ?bytes) -> None):
-
-        self._read_cb = read_cb
-
-        self._client = ssh_client.Client(pcap,
-                                         (lambda c,e: read_cb(e,None)),
-                                         (lambda c,data: read_cb(None,data)),
-                                         address,
-                                         username,
-                                         key,
-                                         password,
-                                         port,
-                                         subsystem,
-                                         skip_host_key_check,
-                                         log_handler)
-
-    proc def write(self, data: bytes):
-        self._client.write(data)
-
-    proc def read_cb(self, cb: action(?Exception, ?bytes) -> None):
-        self._read_cb = cb
-
-    proc def close(self, on_close: ?action() -> None):
-        self._client.close(on_close)
-
-    proc def restart(self):
-        self._client.restart()
 
 class TcpPipe(Pipe):
     _endpoint: _TcpClientPipeEndpoint
