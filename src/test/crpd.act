@@ -1,0 +1,161 @@
+"""Tests against a real Juniper cRPD NETCONF server.
+
+Gated behind the "crpd" tag. Start the device (the image is in the private
+ghcr.io/stratoweave registry, so a `docker login ghcr.io` may be needed):
+
+    docker run -td --name crpd --privileged \
+        --publish 2222:22 --publish 42830:830 \
+        ghcr.io/stratoweave/crpd:24.4r1.9
+
+Then enable NETCONF and create the test user through the JUNOS CLI. The
+password is Admin1 (entered twice at each plain-text-password prompt):
+
+    docker exec -it crpd cli
+    configure
+    set system services ssh
+    set system services netconf ssh
+    set system root-authentication plain-text-password
+    set system login user admin class super-user authentication plain-text-password
+    commit and-quit
+
+Run the tests with:
+
+    acton test --tag crpd --module test.crpd --jobs 1
+
+All tests here are read-only or fully reversible (lock/unlock) so they can
+run against a shared device.
+"""
+
+import logging
+import net
+import testing
+import xml
+
+import netconf
+
+crpd_address = "localhost"
+crpd_port = 42830
+crpd_username = "admin"
+crpd_password = "Admin1"
+
+
+def _crpd_client(t: testing.EnvT, on_connect: action(netconf.Client, ?Exception) -> None) -> netconf.Client:
+    return netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                          address=crpd_address,
+                          port=crpd_port,
+                          username=crpd_username,
+                          password=crpd_password,
+                          key=None,
+                          on_connect=on_connect,
+                          on_notif=None,
+                          skip_host_key_check=True,
+                          log_handler=t.log_handler)
+
+
+actor _test_crpd_hello_capabilities(t: testing.EnvT):
+    """Connect over SSH and verify the JUNOS hello/capability exchange."""
+    t.require("crpd")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to cRPD: {e}"))
+            return
+        caps = c.get_capabilities()
+        has_base = False
+        has_junos = False
+        for cap in caps:
+            if cap.startswith("urn:ietf:params:netconf:base:1."):
+                has_base = True
+            if "juniper.net" in cap:
+                has_junos = True
+        if has_base and has_junos:
+            log.info("cRPD hello completed", {"capabilities": len(caps)})
+            c.close(None)
+            t.success()
+        else:
+            t.failure(ValueError("Unexpected capabilities: base={has_base} junos={has_junos} ({len(caps)} caps)"))
+
+    c = _crpd_client(t, _on_connect)
+
+
+actor _test_crpd_get_config(t: testing.EnvT):
+    """<get-config> of the running datastore returns a JUNOS <configuration>."""
+    t.require("crpd")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to cRPD: {e}"))
+            return
+        c.get_config(_on_get_config, datastore="running")
+
+    def _on_get_config(c: netconf.Client, result: ?xml.Node, error: ?netconf.NetconfError):
+        if error is not None:
+            t.failure(ValueError("get-config failed: {error}"))
+            return
+        found_configuration = False
+        if result is not None:
+            for child in result.children:
+                if child.tag == "data":
+                    for data_child in child.children:
+                        if data_child.tag == "configuration":
+                            found_configuration = True
+        if found_configuration:
+            log.info("cRPD <get-config> returned a configuration")
+            c.close(None)
+            t.success()
+        else:
+            t.failure(ValueError("No <configuration> in get-config reply"))
+
+    c = _crpd_client(t, _on_connect)
+
+
+actor _test_crpd_lock_unlock(t: testing.EnvT):
+    """Lock and unlock the candidate datastore."""
+    t.require("crpd")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to cRPD: {e}"))
+            return
+        c.lock(_on_lock, "candidate")
+
+    def _on_lock(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            t.failure(ValueError("Lock failed: {error}"))
+            return
+        c.unlock(_on_unlock, "candidate")
+
+    def _on_unlock(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            t.failure(ValueError("Unlock failed: {error}"))
+            return
+        log.info("cRPD candidate lock/unlock completed")
+        c.close(None)
+        t.success()
+
+    c = _crpd_client(t, _on_connect)
+
+
+actor _test_crpd_auth_reject(t: testing.EnvT):
+    """A wrong password must be rejected by the real device."""
+    t.require("crpd")
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            t.success()
+        else:
+            t.failure(ValueError("cRPD accepted a wrong password"))
+
+    c = netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                       address=crpd_address,
+                       port=crpd_port,
+                       username=crpd_username,
+                       password="wrong-password",
+                       key=None,
+                       on_connect=_on_connect,
+                       on_notif=None,
+                       skip_host_key_check=True,
+                       log_handler=t.log_handler)
