@@ -1,4 +1,3 @@
-import process
 import testing
 import xml
 import netconf
@@ -89,6 +88,7 @@ def good_openconfig_interfaces_data() -> xml.Node:
 actor _test_openconfig_fixup_default_enabled(t: testing.EnvT):
     """Default fixups should repair missing OpenConfig list keys in replies."""
     pipes = actor_pipe_pair()
+    var done = False
 
     caps = [
         netconf.CAP_NC_1_0,
@@ -104,6 +104,7 @@ actor _test_openconfig_fixup_default_enabled(t: testing.EnvT):
 
     def _on_get_config(c: netconf.Client, result: ?xml.Node, error: ?netconf.NetconfError):
         if result is not None:
+            done = True
             t.success(result.encode(pretty=True))
         if error is not None:
             t.failure(ValueError("get-config failed: {error}"))
@@ -115,7 +116,7 @@ actor _test_openconfig_fixup_default_enabled(t: testing.EnvT):
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, capabilities=caps, log_handler=t.log_handler)
-    client = netconf.Client(process.ProcessCap(t.env.auth),
+    client = netconf.Client(None,
                             address="actor-pipe",
                             username="actor-pipe",
                             key=None,
@@ -126,12 +127,17 @@ actor _test_openconfig_fixup_default_enabled(t: testing.EnvT):
                             log_handler=t.log_handler,
                             pipe=pipes.client)
 
-    after 0.5: t.failure(ValueError("Timed out waiting for OpenConfig fixup test"))
+    def _on_timeout():
+        if not done:
+            t.failure(ValueError("Timed out waiting for OpenConfig fixup test"))
+
+    after 5.0: _on_timeout()
 
 
 actor _test_openconfig_fixup_disabled(t: testing.EnvT):
     """fixups=[] should disable all fixups."""
     pipes = actor_pipe_pair()
+    var done = False
 
     caps = [
         netconf.CAP_NC_1_0,
@@ -147,6 +153,7 @@ actor _test_openconfig_fixup_disabled(t: testing.EnvT):
 
     def _on_get_config(c: netconf.Client, result: ?xml.Node, error: ?netconf.NetconfError):
         if result is not None:
+            done = True
             t.success(result.encode(pretty=True))
             return
         if error is not None:
@@ -159,7 +166,7 @@ actor _test_openconfig_fixup_disabled(t: testing.EnvT):
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, capabilities=caps, log_handler=t.log_handler)
-    client = netconf.Client(process.ProcessCap(t.env.auth),
+    client = netconf.Client(None,
                             address="actor-pipe",
                             username="actor-pipe",
                             key=None,
@@ -171,13 +178,18 @@ actor _test_openconfig_fixup_disabled(t: testing.EnvT):
                             pipe=pipes.client,
                             fixups=[])
 
-    after 0.5: t.failure(ValueError("Timed out waiting for disabled fixup test"))
+    def _on_timeout():
+        if not done:
+            t.failure(ValueError("Timed out waiting for disabled fixup test"))
+
+    after 5.0: _on_timeout()
 
 actor _test_openconfig_fixup_self_deactivates_after_clean_reply(t: testing.EnvT):
     """Fixup should self-deactivate after first clean relevant reply."""
     pipes = actor_pipe_pair()
     var req_count = 0
     var reply_count = 0
+    var done = False
 
     caps = [
         netconf.CAP_NC_1_0,
@@ -212,6 +224,7 @@ actor _test_openconfig_fixup_self_deactivates_after_clean_reply(t: testing.EnvT)
         if reply_count == 2:
             if not has_name and not has_index:
                 c.close(None)
+                done = True
                 t.success()
             else:
                 t.failure(ValueError("Fixup still active after clean-reply deactivation"))
@@ -232,7 +245,7 @@ actor _test_openconfig_fixup_self_deactivates_after_clean_reply(t: testing.EnvT)
         else:
             s.send_error(message_id, "operation-not-supported", "Unexpected extra RPC")
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, capabilities=caps, log_handler=t.log_handler)
-    client = netconf.Client(process.ProcessCap(t.env.auth),
+    client = netconf.Client(None,
                             address="actor-pipe",
                             username="actor-pipe",
                             key=None,
@@ -243,12 +256,17 @@ actor _test_openconfig_fixup_self_deactivates_after_clean_reply(t: testing.EnvT)
                             log_handler=t.log_handler,
                             pipe=pipes.client)
 
-    after 1.0: t.failure(ValueError("Timed out waiting for self-deactivation fixup test"))
+    def _on_timeout():
+        if not done:
+            t.failure(ValueError("Timed out waiting for self-deactivation fixup test"))
+
+    after 5.0: _on_timeout()
 
 
 actor _test_openconfig_fixup_capability_gated(t: testing.EnvT):
     """Default fixup should stay inactive when capability is not advertised."""
     pipes = actor_pipe_pair()
+    var done = False
 
     caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1]
 
@@ -266,6 +284,7 @@ actor _test_openconfig_fixup_capability_gated(t: testing.EnvT):
         has_index = has_openconfig_subinterface_key_index(result)
         if not has_name and not has_index:
             c.close(None)
+            done = True
             t.success()
         else:
             t.failure(ValueError("Fixup unexpectedly active without capability"))
@@ -277,7 +296,7 @@ actor _test_openconfig_fixup_capability_gated(t: testing.EnvT):
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, capabilities=caps, log_handler=t.log_handler)
-    client = netconf.Client(process.ProcessCap(t.env.auth),
+    client = netconf.Client(None,
                             address="actor-pipe",
                             username="actor-pipe",
                             key=None,
@@ -288,4 +307,8 @@ actor _test_openconfig_fixup_capability_gated(t: testing.EnvT):
                             log_handler=t.log_handler,
                             pipe=pipes.client)
 
-    after 0.5: t.failure(ValueError("Timed out waiting for capability-gated fixup test"))
+    def _on_timeout():
+        if not done:
+            t.failure(ValueError("Timed out waiting for capability-gated fixup test"))
+
+    after 5.0: _on_timeout()

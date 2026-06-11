@@ -15,16 +15,16 @@
 
 import logging
 import net
-import process
 import random
 import testing
 import xml
-from pipe import Pipe, actor_pipe_pair
+from pipe import Pipe, actor_pipe_pair as _actor_pipe_pair
 
 from buffer import Buffer, IncompleteReadError
 from fixups import FIXUPS
 from fixups.base import Fixup
-from transport import SshPipe, TcpListenPipe, TcpPipe, TcpPipeListener
+import ssh.pipe as sshpipe
+from transport import TcpListenPipe, TcpPipe, TcpPipeListener
 
 SEPARATOR_FRAMING: int = 0
 CHUNKED_FRAMING: int = 1
@@ -42,6 +42,9 @@ CAP_NC_1_1 = "urn:ietf:params:netconf:base:1.1"
 
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 NS_YANG_ACTION = "urn:ietf:params:xml:ns:yang:1"
+
+def actor_pipe_pair() -> (client: Pipe, server: Pipe):
+    return _actor_pipe_pair()
 
 # TODO: I think this should be in __builtin__
 class UnreachableError(Exception):
@@ -158,7 +161,7 @@ state_name = {
 
 
 actor Client(
-        pcap: ?process.ProcessCap,
+        connect_cap: ?net.TCPConnectCap,
         address: str,
         port: int,
         username: str,
@@ -848,19 +851,21 @@ actor Client(
 
     def _connect():
         if p is None:
-            if pcap is not None:
-                p = SshPipe(pcap=pcap,
-                            address=address,
-                            username=username,
-                            key=key,
-                            password=password,
-                            port=port,
-                            subsystem="netconf",
-                            skip_host_key_check=skip_host_key_check,
-                            log_handler=log_handler,
-                            read_cb=_on_pipe_event)
+            if connect_cap is not None:
+                sp = sshpipe.SshPipe(
+                    connect_cap,
+                    address=address,
+                    port=port,
+                    username=username,
+                    password=password,
+                    private_key_file=key,
+                    subsystem="netconf",
+                    host_key_check=sshpipe.HOST_KEY_CHECK_NONE if skip_host_key_check else sshpipe.HOST_KEY_CHECK_ACCEPT_NEW,
+                    log_handler=log_handler)
+                sp.read_cb(_on_pipe_event)
+                p = sp
             else:
-                on_connect(self, ValueError("auth is required to establish SSH connection"))
+                on_connect(self, ValueError("a TCP connect capability is required to establish an SSH connection"))
         else:
             if p is not None:
                 p.read_cb(_on_pipe_event)
@@ -1235,7 +1240,7 @@ actor _test_client_server_actor_pipe_get(t: testing.EnvT):
             t.failure(ValueError("Unexpected hostname in reply: {hostname}"))
 
     server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
-    client = Client(process.ProcessCap(t.env.auth),
+    client = Client(None,
                     address="actor-pipe",
                     username="actor-pipe",
                     key=None,
@@ -1250,7 +1255,8 @@ actor _test_client_server_actor_pipe_get(t: testing.EnvT):
 actor _test_client_server_tcp_get(t: testing.EnvT):
     """Test loopback TCP Client <-> Server over TcpPipe with a static <get> reply."""
     log = logging.Logger(t.log_handler)
-    port = random.randint(20000, 29999)
+    var port = random.randint(20000, 29999)
+    var listen_attempts = 0
     var done = False
     var servers: list[Server] = []
     var listener: ?TcpPipeListener = None
@@ -1286,12 +1292,19 @@ actor _test_client_server_tcp_get(t: testing.EnvT):
 
     def _on_listen(l: TcpPipeListener, err: ?Exception):
         if err is not None:
-            _fail_once(ValueError("Failed to start TCP listener on 127.0.0.1:{port}: {err}"))
+            # net.TCPListener cannot report an ephemerally-bound port, so we
+            # pick random ones; on a (rare) collision just retry with a new one.
+            if listen_attempts < 5:
+                listen_attempts += 1
+                port = random.randint(20000, 29999)
+                listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
+            else:
+                _fail_once(ValueError("Failed to start TCP listener on 127.0.0.1:{port}: {err}"))
             return
 
         log.info("TCP listener ready", {"port": port})
         client_pipe = TcpPipe(connect_cap=connect_cap, address="127.0.0.1", port=port)
-        client = Client(process.ProcessCap(t.env.auth),
+        client = Client(None,
                         address="127.0.0.1",
                         username="tcp-pipe",
                         key=None,
@@ -1340,6 +1353,344 @@ actor _test_client_server_tcp_get(t: testing.EnvT):
     listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
 
 
+_ssh_test_username = "netconf"
+_ssh_test_password = "sekret"
+
+def _ssh_test_auth(user: str, password: ?str, pubkey: ?bytes) -> bool:
+    return user == _ssh_test_username and password == _ssh_test_password
+
+
+actor _SshTestServer(t: testing.EnvT,
+                     on_rpc: action(Server, str, xml.Node) -> None,
+                     on_port: action(int) -> None,
+                     on_error: action(str) -> None,
+                     capabilities: ?list[str]=None):
+    """A minimal NETCONF server over SSH: SshPipeListener feeding netconf.Server.
+
+    Serves the "netconf" subsystem with password authentication; every accepted
+    SSH channel becomes an independent NETCONF session driven by on_rpc.
+    """
+    var listener: ?sshpipe.SshPipeListener = None
+    var sessions: list[Server] = []
+
+    def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        if err is not None:
+            on_error("SSH listen error: {err}")
+            return
+        port = await async l.bound_port()
+        on_port(int(port))
+
+    def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
+        sessions.append(Server(pipe=p, on_rpc=on_rpc, capabilities=capabilities,
+                               log_handler=t.log_handler))
+
+    def close():
+        l = listener
+        if l is not None:
+            l.close()
+
+    listener = sshpipe.SshPipeListener(
+        net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+        address="127.0.0.1",
+        port=0,
+        on_listen=_on_listen,
+        on_accept=_on_accept,
+        auth_check=_ssh_test_auth,
+        subsystem="netconf",
+        log_handler=t.log_handler)
+
+
+actor _test_client_server_ssh_get(t: testing.EnvT):
+    """Loopback NETCONF Client <-> Server over a real SSH transport (chunked framing)."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        if op.tag != "get":
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+            return
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="ssh-loopback-demo")
+            ])
+        ])])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        hostname = None
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for data_child in rpc_child.children:
+                        if data_child.tag == "system":
+                            for system_child in data_child.children:
+                                if system_child.tag == "hostname":
+                                    hostname = system_child.text
+        if hostname == "ssh-loopback-demo":
+            log.info("Loopback SSH NETCONF <get> completed")
+            c.close(None)
+            _success_once()
+        else:
+            _fail_once(ValueError("Unexpected hostname in reply: {hostname}"))
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for loopback SSH NETCONF <get>"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_legacy_framing(t: testing.EnvT):
+    """SSH loopback against a 1.0-only server: legacy ]]>]]> framing end-to-end."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="ssh-legacy-demo")
+            ])
+        ])])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        # A 1.0-only server exchange only completes if both sides stayed on
+        # legacy separator framing; chunked frames would never parse.
+        log.info("Loopback SSH NETCONF <get> with legacy framing completed")
+        c.close(None)
+        _success_once()
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for legacy framing SSH NETCONF <get>"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, capabilities=[CAP_NC_1_0])
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_auth_reject(t: testing.EnvT):
+    """Wrong SSH password: connect fails, on_connect carries the error."""
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        pass
+
+    def _on_connect(c: Client, e: ?Exception):
+        if done:
+            return
+        done = True
+        s = srv
+        if s is not None:
+            s.close()
+        if e is not None:
+            t.success()
+        else:
+            t.failure(ValueError("Connect succeeded with wrong password"))
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password="wrong-password",
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def _on_timeout():
+        if not done:
+            done = True
+            s = srv
+            if s is not None:
+                s.close()
+            t.failure(ValueError("Timed out waiting for SSH auth reject"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_large_reply(t: testing.EnvT):
+    """A reply spanning many SSH channel reads survives reassembly intact."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+    N_ENTRIES = 2000
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        entries = []
+        for i in range(N_ENTRIES):
+            entries.append(xml.Node("entry", children=[
+                xml.Node("index", text=str(i)),
+                xml.Node("value", text="payload-{i}-abcdefghijklmnopqrstuvwxyz")
+            ]))
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=entries)])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        count = 0
+        last_ok = False
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for entry in rpc_child.children:
+                        if entry.tag == "entry":
+                            count += 1
+                            for f in entry.children:
+                                if f.tag == "index" and f.text == str(N_ENTRIES - 1):
+                                    last_ok = True
+        if count == N_ENTRIES and last_ok:
+            log.info("Large SSH NETCONF reply reassembled", {"entries": count})
+            c.close(None)
+            _success_once()
+        else:
+            _fail_once(ValueError("Large reply corrupted: {count} entries, last_ok={last_ok}"))
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for large SSH NETCONF reply"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 15.0: _on_timeout()
+
+
 actor _test_netconf(t: testing.EnvT):
     """Test SSH client towards a NETCONF server, like notconf
     """
@@ -1365,7 +1716,7 @@ actor _test_netconf(t: testing.EnvT):
             log.info("<get-config> success")
             t.success()
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 address=test_address,
                 username=test_username,
@@ -1405,7 +1756,7 @@ actor _test_get_schema(t: testing.EnvT):
             log.error("<get-schema> received null response")
             t.failure(ValueError("get-schema returned null"))
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1445,7 +1796,7 @@ actor _test_list_schemas(t: testing.EnvT):
                 log.warning("No schemas found")
                 t.failure(Exception("No schemas found"))
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1507,7 +1858,7 @@ actor _test_schema_getter(t: testing.EnvT):
         else:
             t.success()
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1551,7 +1902,7 @@ actor _test_lock_unlock(t: testing.EnvT):
             log.info("Lock and unlock test completed successfully")
             t.success()
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1611,7 +1962,7 @@ actor _test_get_config_with_filter(t: testing.EnvT):
             log.error("<get-config> with filter received null response")
             t.failure(ValueError("get-config with filter returned null"))
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1667,7 +2018,7 @@ actor _test_get_config_with_xpath_filter(t: testing.EnvT):
             log.error("<get-config> with XPath filter received null response")
             t.failure(ValueError("get-config with XPath filter returned null"))
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
@@ -1706,7 +2057,7 @@ actor _test_rpc_error_repr(t: testing.EnvT):
             log.error("Expected an error from invalid lock operation, but got success")
             t.failure(ValueError("Lock on non-existent datastore should have failed"))
 
-    c = Client(process.ProcessCap(t.env.auth),
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
                 on_connect=_on_connect,
                 on_notif=None,
                 address=test_address,
