@@ -29,9 +29,9 @@ run against a shared device.
 import logging
 import net
 import testing
-import xml
+import std.xml as xml
 
-import netconf
+import lib as netconf
 
 crpd_address = "localhost"
 crpd_port = 42830

@@ -17,7 +17,7 @@ import logging
 import net
 import random
 import testing
-import xml
+import std.xml as xml
 from pipe import Pipe, actor_pipe_pair as _actor_pipe_pair
 
 from buffer import Buffer, IncompleteReadError

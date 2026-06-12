@@ -1,4 +1,4 @@
-import xml
+import std.xml as xml
 from fixups.base import Fixup
 
 def unwrap[T](a: ?T, msg: ?str=None) -> T:
