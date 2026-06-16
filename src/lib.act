@@ -1356,10 +1356,6 @@ actor _test_client_server_tcp_get(t: testing.EnvT):
 _ssh_test_username = "netconf"
 _ssh_test_password = "sekret"
 
-def _ssh_test_auth(user: str, password: ?str, pubkey: ?bytes) -> bool:
-    return user == _ssh_test_username and password == _ssh_test_password
-
-
 actor _SshTestServer(t: testing.EnvT,
                      on_rpc: action(Server, str, xml.Node) -> None,
                      on_port: action(int) -> None,
@@ -1389,13 +1385,16 @@ actor _SshTestServer(t: testing.EnvT,
         if l is not None:
             l.close()
 
+    def _auth(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        respond(user == _ssh_test_username and password == _ssh_test_password)
+
     listener = sshpipe.SshPipeListener(
         net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
         address="127.0.0.1",
         port=0,
         on_listen=_on_listen,
         on_accept=_on_accept,
-        auth_check=_ssh_test_auth,
+        auth_check=_auth,
         subsystem="netconf",
         log_handler=t.log_handler)
 
