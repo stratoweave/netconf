@@ -8,8 +8,8 @@ dependencies = {
     ),
     "ssh": (
         repo_url="https://github.com/actonlang/acton-ssh",
-        url="https://github.com/actonlang/acton-ssh/archive/2c476ef4430c8bdae58097d2ea8d1c3214b68f9c.zip",
-        hash="N-V-__8AAAFQBAC2tM6KldFdmknnkhXLIRVJoLaspcU0vUdw"
+        url="https://github.com/actonlang/acton-ssh/archive/049571b80eb3891aea6845d058b475c363dde0ce.zip",
+        hash="N-V-__8AAAhQBACfpXP7tFlwunmgtWAY7Q79FlIO2j4XiTQY"
     )
 }
 zig_dependencies = {}
