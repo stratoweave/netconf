@@ -74,7 +74,7 @@ def unwrap[T](a: ?T, msg: ?str=None) -> T:
 
 
 class NetconfError(Exception):
-    def __init__(self, error_message: ?str, rpc_error: ?list[RpcError]):
+    def __init__(self, error_message: ?str, rpc_error: ?list[RpcError]=None):
         self.error_message = error_message if error_message is not None else ""
         self.rpc_error = rpc_error
 
@@ -624,25 +624,31 @@ actor Client(
             # Get the complete yang-library data including:
             # - datastore definitions (to know which module-sets each datastore uses)
             # - module-sets (containing modules and import-only-modules)
-            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
-                xml.Node("yang-library",
-                    [(None, "urn:ietf:params:xml:ns:yang:ietf-yang-library")],
-                    children=[
-                        xml.Node("datastore"),
-                        xml.Node("schema"),
-                        xml.Node("module-set")
-                    ]
-                )
-            ], None, None)
+            filter_node = xml.Node("filter",
+                attributes=[("type", "subtree")],
+                children=[
+                    xml.Node("yang-library",
+                        [(None, "urn:ietf:params:xml:ns:yang:ietf-yang-library")],
+                        children=[
+                            xml.Node("datastore"),
+                            xml.Node("schema"),
+                            xml.Node("module-set")
+                        ]
+                    )
+                ]
+            )
             get(parse_response_yang_library, filter_node)
         elif supports_netconf_monitoring:
             _log.debug("Using ietf-netconf-monitoring for schema discovery")
-            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
-                xml.Node("netconf-state",
-                    [(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring")],
-                    children=[xml.Node("schemas")]
-                )
-            ], None, None)
+            filter_node = xml.Node("filter",
+                attributes=[("type", "subtree")],
+                children=[
+                    xml.Node("netconf-state",
+                        [(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring")],
+                        children=[xml.Node("schemas")]
+                    )
+                ]
+            )
             get(parse_response_netconf_monitoring, filter_node)
         else:
             # No schema discovery methods advertised
@@ -1135,12 +1141,12 @@ actor SchemaGetter(client):
             """Download the next schema in the queue"""
             if current_download_index >= len(schemas):
                 # All schemas downloaded successfully
-                on_done(self)
+                on_done(self, None)
                 return
             schema = schemas[current_download_index]
 
             # Use "yang" as default format if not specified
-            format_str = schema.format if schema.format is not None else "yang"
+            format_str = unwrap(schema.format) if schema.format is not None else "yang"
             client.get_schema(
                 lambda c, r, e: _on_get_schema(current_download_index, c, r, e),
                 schema.identifier, schema.version, format_str
@@ -1162,7 +1168,7 @@ actor SchemaGetter(client):
 
                 # Call the callback with current progress and schema data
                 if schema_data is not None and schema_data.strip() != "":
-                    on_get_schema(self, current_download_index+1, len(schemas), schema, schema_data)
+                    on_get_schema(self, current_download_index+1, len(schemas), schema, schema_data, None)
                 else:
                     on_get_schema(self, current_download_index+1, len(schemas), schema, None, NetconfError("Missing schema data"))
 
@@ -1927,16 +1933,19 @@ actor _test_get_config_with_filter(t: testing.EnvT):
             log.info("Connected to NETCONF server")
             # Create a subtree filter to get only specific configuration
             # Example: filter for interfaces configuration
-            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
-                xml.Node("interfaces",
-                    [(None, "urn:ietf:params:xml:ns:yang:ietf-interfaces")],
-                    children=[
-                        xml.Node("interface", children=[
-                            xml.Node("name", text="eth0")
-                        ])
-                    ]
-                )
-            ])
+            filter_node = xml.Node("filter",
+                attributes=[("type", "subtree")],
+                children=[
+                    xml.Node("interfaces",
+                        [(None, "urn:ietf:params:xml:ns:yang:ietf-interfaces")],
+                        children=[
+                            xml.Node("interface", children=[
+                                xml.Node("name", text="eth0")
+                            ])
+                        ]
+                    )
+                ]
+            )
             c.get_config(_on_get_config_filtered, "running", filter_node)
 
     def _on_get_config_filtered(c: Client, result: ?xml.Node, error: ?NetconfError):
@@ -1987,10 +1996,10 @@ actor _test_get_config_with_xpath_filter(t: testing.EnvT):
             log.info("Connected to NETCONF server")
             # Create an XPath filter to select specific configuration elements
             # Example: select all interface names
-            filter_node = xml.Node("filter", None, None,
-                [("type", "xpath"),
-                 ("select", "/interfaces/interface/name")],
-                []
+            filter_node = xml.Node("filter",
+                attributes=[("type", "xpath"),
+                            ("select", "/interfaces/interface/name")],
+                children=[]
             )
             c.get_config(_on_get_config_xpath_filtered, "running", filter_node)
 
